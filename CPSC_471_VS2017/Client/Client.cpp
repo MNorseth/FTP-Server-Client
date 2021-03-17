@@ -16,42 +16,82 @@
 #include <experimental/filesystem>
 #endif
 #include <string>
+#include <limits>
+#include <map>
+#include <cctype>
 #include "Connection.h"
+#include "SyncStream.h"
 
 using namespace std;
 using namespace connection;
 namespace fs = std::experimental::filesystem;
 
-// temp: change to some reasonable value
-constexpr long RESPONSE_TIMEOUT_MS = 500000; // how long to wait on a response from the server
-constexpr long CONNECTION_WAIT_TIMEOUT = 500000; // how long to wait for server to connect to our data channel
 
-void run_client(Connection::Ptr connection);
-void handle_ls(Connection::Ptr connection);
-void handle_get(Connection::Ptr connection, const string& filename, const string& outputFname);
-void handle_put(Connection::Ptr connection, const string& filename);
-void handle_quit(Connection::Ptr connection);
+constexpr long RESPONSE_TIMEOUT_MS = 10000; // how long to wait on a response from the server
+constexpr long CONNECTION_WAIT_TIMEOUT = 10000; // how long to wait for server to connect to our data channel
+constexpr int kTerminalLength = 79;
 
-int main()
+
+// function prototypes
+bool parse_arguments(int argc, const char** argv, string& address, port_t& port);
+
+void run_client();
+bool parse_command(MSGID command);
+bool exchange_greetings();
+void handle_ls();
+void handle_get(const string& filename);
+void handle_put(const string& filename);
+void handle_quit();
+void make_header(const std::string& msg, uint64_t bytes);
+bool get_yesno();
+
+struct CommandLookupComp {
+    bool operator()(const string& lhs, const string& rhs) const {
+        std::string ulhs;
+        std::string urhs;
+
+        std::transform(lhs.cbegin(), lhs.cend(), std::back_inserter(ulhs), [](char c) { return static_cast<char>(std::toupper(c)); });
+        std::transform(rhs.cbegin(), rhs.cend(), std::back_inserter(urhs), [](char c) { return static_cast<char>(std::toupper(c)); });
+
+        return ulhs.compare(urhs) < 0;
+    }
+};
+
+typedef map<string, MSGID, CommandLookupComp> CommandLookupTable;
+const CommandLookupTable kCommands =
 {
+    { "GET",    MSGID::MESSAGE_GET  },
+    { "PUT",    MSGID::MESSAGE_PUT  },
+    { "LS",     MSGID::MESSAGE_LS   },
+    { "QUIT",   MSGID::MESSAGE_QUIT },
+    { "Q",      MSGID::MESSAGE_QUIT },
+    { "EXIT",   MSGID::MESSAGE_QUIT }
+};
+
+Connection::Ptr kControl;
+
+int main(int argc, const char** argv)
+{
+    string address;
+    port_t port;
+
+    if (!parse_arguments(argc, argv, address, port))
+        return EXIT_FAILURE;
+
     Connection::initialize();
 
     try {
-        //
-        // TODO (client):
-        //
-        // 1) use command line arguments to connect to server
-        // 2) read commands from cin and run appropriate functions
-        // 3) implement PUT command (needs implementation on server side also)
-
-        auto connection = Connection::connect("127.0.0.1", 25000); // localhost
-        //auto connection = Connection::connect("192.168.5.130", 25000); // virtualbox linux (set to appropriate IP)
-        cout << "Successfully connected to server! using port " << connection->host_port() << endl;
-
-        run_client(connection);
+        kControl = Connection::connect(address, port);
     }
     catch (const ConnectionException& e) {
         cerr << "error connecting to server: " << e.what() << endl;
+    }
+
+    try {
+        run_client();
+    }
+    catch (const std::exception& e) {
+        cerr << "error: " << e.what() << "\nConnection closed." << endl;
     }
 
     Connection::deinitialize();
@@ -60,41 +100,102 @@ int main()
 }
 
 
-void run_client(Connection::Ptr connection) {
+void run_client() {
+    if (!exchange_greetings()) return;
+
+    // read commands from user instead
+    string input;
+    CommandLookupTable::const_iterator it;
+
+    do {
+        cout << "ftp> ";
+        cin >> input;
+
+        if (input.empty()) continue;
+        
+        // try to match input with command
+        it = kCommands.find(input);
+
+        if (it == kCommands.cend()) {
+            cerr << "invalid command. Valid commands are:\n";
+
+            for (const auto& kvp : kCommands)
+                cerr << "\t" << kvp.first << endl;
+            cerr << endl;
+            continue;
+        }
+
+    } while (it == kCommands.cend() /* no command chosen */ || parse_command(it->second));
+
+    cout << "Goodbye!" << endl;
+}
+
+
+// return true if should continue running
+// avoids having a bunch of complexity in run_client: each command might need arguments user supplied
+bool parse_command(MSGID command) {
+    switch (command) {
+        case MSGID::MESSAGE_LS:
+            handle_ls();
+            break;
+
+        case MSGID::MESSAGE_GET:
+            // should be another argument: filename
+            {
+                string fname;
+                cin >> fname;
+
+                handle_get(fname);
+            }
+            break;
+
+
+        case MSGID::MESSAGE_PUT:
+        
+            cerr << "not implemented yet" << endl;
+            break;
+
+        case MSGID::MESSAGE_QUIT:
+            handle_quit();
+            return false;
+
+        default:
+            cerr << "Unrecognized command: " << command << endl;
+    }
+
+    return true;
+}
+
+
+
+bool exchange_greetings() {
     Message msg;
     bool timeout = false;
 
     ZERO_MSG(&msg);
 
     msg.msgid = MSGID::MESSAGE_HELLO;
-    connection->send(msg);
+    kControl->send(msg);
 
     // expect greetings back
-    auto bytesReceived = connection->receive(&msg, 20000, &timeout);
+    auto bytesReceived = kControl->receive(&msg, 20000, &timeout);
 
     if (timeout) {
-        cout << connection->identify_remote() << " timed out; closing connection" << endl;
-        return;
+        cout << kControl->identify_remote() << " timed out; closing connection" << endl;
+        return false;
     }
 
     if (msg.msgid != MSGID::MESSAGE_HELLO || bytesReceived < MESSAGE_BYTE_LEN) {
-        cout << connection->identify_remote() << " sent incorrect response; closing connection" << endl;
-        return;
+        cout << kControl->identify_remote() << " sent incorrect response; closing connection" << endl;
+        return false;
     }
 
     cout << "Established connection with " << msg.payload << endl;
-
-    // test out commands
-    handle_ls(connection);
-    handle_get(connection, "testfile_small.txt", "retrieved.txt");
-	handle_put(connection, "testfile_small1.txt");
-    handle_quit(connection);
-
-    // TODO: read commands from user instead
+    return true;
 }
 
 
-void handle_ls(Connection::Ptr connection) {
+void handle_ls() {
     auto msg = MAKE_MSG(MSGID::MESSAGE_LS);
     Message response; ZERO_MSG(&response);
     bool bListen = true;
@@ -102,15 +203,15 @@ void handle_ls(Connection::Ptr connection) {
 
     Connection::StopListeningQuery stopListening = [&bListen]() { return !bListen; };
     Connection::ErrorCallback onError = [](const ConnectionException& ce) { throw ce; return false; };
-    Connection::SocketCreatedCallback onListen = [&connection, &msg](const std::string& remoteHost, port_t port) {
+    Connection::SocketCreatedCallback onListen = [&msg](const std::string& remoteHost, port_t port) {
         // let the server know which port to connect to
         msg.port = port;
-        connection->send(msg);
+        kControl->send(msg);
     };
 
     Connection::ConnectionEstablishedCallback onEstablished = [&](Connection::Ptr dataChannel) {
         // expecting OK or ERROR from server
-        connection->receive(&response, RESPONSE_TIMEOUT_MS, &timedOut);
+        kControl->receive(&response, RESPONSE_TIMEOUT_MS, &timedOut);
 
         if (timedOut)
             throw ConnectionException("server response timed out");
@@ -140,8 +241,9 @@ void handle_ls(Connection::Ptr connection) {
             bytesLeft -= received;
         }
 
-        cout << "Bytes received: " << response.datalen << endl;
-        cout << "List of files on server:\n" << buf.str() << endl;
+        make_header("Listing files on server", response.datalen);
+        cout << buf.str() << endl << endl;
+
         dataChannel->shutdown();
     };
 
@@ -150,38 +252,37 @@ void handle_ls(Connection::Ptr connection) {
 
 
 // note: refactor to remove common connection code
-void handle_get(Connection::Ptr connection, const string& filename, const string& outputFname) {
+void handle_get(const string& filename) {
     auto command = MAKE_MSG(MSGID::MESSAGE_GET, filename);
     Message response; ZERO_MSG(&response);
     bool bListen = true;
     bool timedOut = false;
     fstream output;
 
-    // try to open file before doing anything; this might fail on our end and we
-    // needn't send anything to the server at all
-    output.open(outputFname.c_str(), output.binary | output.in | output.out | output.trunc);
+    if (fs::exists(filename)) {
+        cout << "WARNING: " << filename << " already exists. Overwrite? Y/N" << endl;
 
-    // TODO: handle case where file already exists locally, doesn't exist on server, and server responds
-    // with an error message, effectively deleting local file
-
-    if (!output.good()) {
-        cerr << "Couldn't open " << outputFname << " for writing" << endl;
-        return;
+        if (!get_yesno()) {
+            cout << "Command cancelled" << endl;
+            return;
+        }
     }
 
-    Connection::StopListeningQuery stopListening = [&bListen]() { return !bListen; };
+
+    Connection::StopListeningQuery stopListening = [&bListen]() { 
+        return !bListen; 
+    };
+
     Connection::ErrorCallback onError = [](const ConnectionException& ce) {
         throw ce; return false;
     };
-    Connection::SocketCreatedCallback onListen = [&command, &connection](const std::string& remoteHost, port_t port) {
+
+    Connection::SocketCreatedCallback onListen = [&](const std::string& remoteHost, port_t port) {
         command.port = port;
-        connection->send(command);
-    };
+        kControl->send(command);
 
-
-    Connection::ConnectionEstablishedCallback onEstablished = [&](Connection::Ptr dataChannel) {
         // expecting OK or ERROR from server
-        connection->receive(&response, RESPONSE_TIMEOUT_MS, &timedOut);
+        kControl->receive(&response, RESPONSE_TIMEOUT_MS, &timedOut);
 
         if (timedOut)
             throw ConnectionException("server response timed out");
@@ -199,10 +300,18 @@ void handle_get(Connection::Ptr connection, const string& filename, const string
             default:
                 throw ConnectionException(("unexpected server response: " + response.to_string()));
         }
+    };
 
+
+    Connection::ConnectionEstablishedCallback onEstablished = [&](Connection::Ptr dataChannel) {
+        output.open(filename.c_str(), output.binary | output.in | output.out | output.trunc);
+
+        if (!output.good()) {
+            cerr << "Couldn't open " << filename << " for writing" << endl;
+            return;
+        }
 
         NetworkDataStream ds(output);
-
         auto bytesLeft = response.datalen;
 
         try {
@@ -215,7 +324,7 @@ void handle_get(Connection::Ptr connection, const string& filename, const string
             }
         }
         catch (const ConnectionException& ce) {
-            cerr << "Failed to receive " << outputFname << ": missing " << bytesLeft << " bytes" << endl;
+            cerr << "Failed to receive " << filename << ": missing " << bytesLeft << " bytes" << endl;
             cerr << "Error: " << ce.what() << endl;
         }
 
@@ -226,8 +335,8 @@ void handle_get(Connection::Ptr connection, const string& filename, const string
         dataChannel->shutdown();
 
         if (bytesLeft == 0) {
-            cout << "Received " << outputFname << " successfully!\n\ttransferred " << bytesReceived << " bytes" << endl;
-        } else cerr << "Failed to receive " << outputFname << ": received " << bytesReceived << " of " << response.datalen << " bytes" << endl;
+            cout << "Received " << filename << " successfully!\n\tTransferred " << bytesReceived << " bytes" << endl;
+        } else cerr << "Failed to receive " << filename << ": received " << bytesReceived << " of " << response.datalen << " bytes" << endl;
     };
 
 
@@ -235,77 +344,212 @@ void handle_get(Connection::Ptr connection, const string& filename, const string
 }
 
 
-void handle_put(Connection::Ptr connection, const string& filename) {
+void handle_put(const string& filename) {
+	Connection::Ptr dataChannel;
 	auto command = MAKE_MSG(MSGID::MESSAGE_PUT, filename);
 	Message response; ZERO_MSG(&response);
 	fstream input;
-	Message putMessage;
+	fs::path filePath(filename);
+	std::streampos fileSize = 0;
 	bool bListen = true;
 	bool timedOut = false;
 
-	input.open(filename.c_str(), input.binary | input.in | input.out | input.trunc);
+	// first check for failure scenarios:
+	// did they actually specify a filename?
+	if (filename.empty()) {
+		response = MAKE_EMSG(MSGECODE::ERR_INVALID_FILENAME);
+        cerr << "error: filename required" << endl;
+        return;
+	}
 
-	if (!input.good()) {
-		cerr << "Couldn't open " << filename << " for writing" << endl;
+	// did they try to use some kind of path (not allowed for now)
+	if (filename.find('/') != std::string::npos || filename.find('\\') != std::string::npos) {
+		cerr << "'" << filename << "' contains a path which is not permitted";
 		return;
 	}
 
-	Connection::StopListeningQuery stopListening = [&bListen]() { return !bListen; };
+	// does their filename exist?
+	if (!fs::exists(fs::path(filename))) {
+		cerr << "File '" << filename << "' not found";
+		return;
+	}
+
+	// did they specify something that isn't a file?
+	if (!fs::is_regular_file(filePath)) {
+		cerr << "'" << filename << "' is not a file - only files may be sent with this command";
+		return;
+	}
+
+
+    input.open(filename.c_str(), input.binary | input.in | input.out );
+
+	if (!input.good() || !input.is_open()) {
+        cerr << "Failed to open '" << filename << "'" << endl;
+        return;
+    }
+
+	// find out number of bytes in the file
+    input.seekg(0, input.end);
+	fileSize = input.tellg();
+    input.seekg(0, input.beg);
+
+    command.datalen = fileSize;
+
+	// it's possible seek failed for some reason, and if we can't tell the size
+	// of the file we're toast already
+	if (!input.good()) {
+		cerr << "Unable to determine length of '" << filename << "'" << endl;
+        return;
+	}
+	
+
+    // file is open, all checks on client-side have passed: prepare to send the file
+
+	Connection::StopListeningQuery stopListening = [&bListen]() { 
+        return !bListen; 
+    };
+
 	Connection::ErrorCallback onError = [](const ConnectionException& ce) {
 		throw ce; return false;
 	};
-	Connection::SocketCreatedCallback onListen = [&command, &connection](const std::string& remoteHost, port_t port) {
+
+	Connection::SocketCreatedCallback onListen = [&](const std::string& remoteHost, port_t port) {
+        // once port is listening, we know which port server should connect to
 		command.port = port;
-		connection->send(command);
+        kControl->send(command);
+
+        // expecting OK or ERROR from server
+        // ERROR would tell us server isn't going to be connecting at all
+        kControl->receive(&response, RESPONSE_TIMEOUT_MS, &timedOut);
+
+        if (timedOut)
+            throw ConnectionException("server response timed out");
+
+        switch (response.msgid) {
+            case MSGID::MESSAGE_ERROR:
+                bListen = false;
+                cerr << response.to_string() << endl;
+                return;
+
+            case MSGID::MESSAGE_OK:
+                // all good to go
+                break;
+
+            default:
+                throw ConnectionException(("unexpected server response: " + response.to_string()));
+        }
 	};
+
 
 	Connection::ConnectionEstablishedCallback onEstablished = [&](Connection::Ptr dataChannel) {
-		// expecting OK or ERROR from server
-		connection->receive(&response, RESPONSE_TIMEOUT_MS, &timedOut);
+		// now actually stream the data over to the server. Connection handles splitting
+		// this in chunks for us
+		NetworkDataStream stream(input);
 
-		if (timedOut)
-			throw ConnectionException("server response timed out");
+		const auto bytesSent = dataChannel->send(stream);
 
-		switch (response.msgid) {
-		case MSGID::MESSAGE_ERROR:
-			bListen = false;
-			cerr << "error: " << response.to_string() << endl;
-			return;
+		dataChannel->shutdown();
 
-		case MSGID::MESSAGE_OK:
-			// all good to go
-			break;
-
-		default:
-			throw ConnectionException(("unexpected server response: " + response.to_string()));
+		// that's it, just make sure we sent everything and let the data connection close
+		if (bytesSent != fileSize) {
+			cout << "Transmission incomplete! Sent " << bytesSent << " bytes of " << fileSize << " bytes to " << dataChannel->identify_remote() << endl;
 		}
-
-		NetworkDataStream ds(input);
-
-		auto bytesLeft = response.datalen;
-
-		try {
-			while (bytesLeft > 0) {
-				// return value of sent is guaranteed to be int or smaller
-				auto received = static_cast<uint64_t>(dataChannel->receive(ds, bytesLeft > CHUNK_SIZE ? CHUNK_SIZE : static_cast<int>(bytesLeft)));
-				bytesLeft -= received;
-
-				input.flush();
-			}
-		}
-		catch (const ConnectionException& ce) {
-			cerr << "Failed to send " << filename << ": missing " << bytesLeft << " bytes" << endl;
-			cerr << "Error: " << ce.what() << endl;
-		}
+		else cout << "Successfully sent transferred '" << filename << "' to server: " << bytesSent << " bytes were sent" << endl;
 	};
 
-	Connection::welcome(Connection::PORT_ANY, stopListening, onListen, onEstablished, onError, true);
+    // callbacks are set up, now kick off actual operation
+	Connection::welcome(Connection::PORT_ANY, stopListening, onListen, onEstablished, onError, true, CONNECTION_WAIT_TIMEOUT);
 }
 
 
-void handle_quit(Connection::Ptr connection) {
+void handle_quit() {
     // let server know we're done
     const auto msg = MAKE_MSG(MSGID::MESSAGE_QUIT, "Goodbye!");
-    connection->send(msg);
-    connection->shutdown();
+    kControl->send(msg);
+    kControl->shutdown();
+}
+
+
+inline string getExe(const char* str) {
+    string s(str);
+
+    auto idx = s.find_last_of('/');
+
+    if (idx == string::npos)
+        idx = s.find_last_of('\\');
+
+    if (idx != string::npos)
+        return s.substr(idx + 1);
+    else return s;
+}
+
+
+#undef max
+
+bool parse_arguments(int argc, const char** argv, string& address, port_t& port) {
+    string serverAddress;
+    string serverPort;
+    auto iPort = std::stoi("0"); // decltype only available in C++17
+
+    if (argc != 3) goto print_usage;
+
+    serverAddress = *(argv + 1);
+    serverPort = *(argv + 2);
+
+    // port must be a numerical value obviously
+    try {
+        iPort = std::stoi(serverPort.c_str());
+
+        // deal with overflow potential (if port isn't a 2-byte type)
+        if (sizeof(port_t) < sizeof(iPort)) {
+            const auto maxValue = std::numeric_limits<port_t>().max();
+
+            if (iPort > maxValue) {
+                cerr << "'" << iPort << "' is out of range. Range is [1, " << maxValue << "]" << endl;
+                goto print_usage;
+            } 
+        }
+    } catch (...) {
+        cerr << "'" << serverPort << "' is not a numeric value" << endl;
+        goto print_usage;
+    }
+
+    port = static_cast<port_t>(iPort);
+    address = serverAddress;
+
+    return !serverAddress.empty() && port > 0;
+
+print_usage:
+    cerr << "Usage: " << getExe(*argv) << " <server machine> <server port>" << endl;
+    return false;
+}
+
+
+void make_header(const std::string& msg, uint64_t bytes) {
+
+    cout << string(kTerminalLength, '*') << endl;
+    cout << "* " << msg << string(kTerminalLength - 2 - msg.length() - 1, ' ') << "*" << endl;
+
+    std::string secondMsg = string("* Bytes transferred: ") + std::to_string(bytes);
+    
+    secondMsg += string(kTerminalLength - secondMsg.length() - 1, ' ');
+    secondMsg += '*';
+
+    cout << secondMsg << endl;
+    cout << string(kTerminalLength, '*') << endl;
+}
+
+
+bool get_yesno() {
+    string input;
+
+    do {
+        cin >> input;
+
+        if (input.empty()) continue;
+        if (std::toupper(input.front()) == 'Y') return true;
+        if (std::toupper(input.front()) == 'N') return false;
+
+        cout << "Y/N? ";
+    } while (true);
 }
